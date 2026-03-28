@@ -1,0 +1,31 @@
+name = "echo-runway"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["0 */6 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-runway"
+database_id = "2c781236-a076-449b-a538-75e4ff1cc348"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "5c6507fb9cd540c48838f95e04a06fd5"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "echo-prime-media"
+
+[vars]
+WORKER_VERSION = "1.0.0"
+
+[[services]]
+binding = "SVC_ENGINE"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SVC_BRAIN"
+service = "echo-shared-brain"
