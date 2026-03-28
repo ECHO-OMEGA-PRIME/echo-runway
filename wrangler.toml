@@ -29,3 +29,7 @@ service = "echo-engine-runtime"
 [[services]]
 binding = "SVC_BRAIN"
 service = "echo-shared-brain"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
