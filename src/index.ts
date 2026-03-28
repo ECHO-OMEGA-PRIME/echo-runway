@@ -1,16 +1,17 @@
 /**
  * Echo Runway — AI Fashion Content Platform
- * v1.0.0 | Cloudflare Worker
+ * v2.0.0 | Cloudflare Worker
  *
  * Multi-tenant backend for AI-powered fashion content creation.
  * Features: product catalog, AI content pipeline, analytics,
- * Shopify integration, embeddable widget config, video metadata.
+ * Shopify integration, embeddable widget config, video metadata,
+ * Stripe payment integration with subscription management.
  *
  * D1 Tables: tenants, products, product_images, content_jobs,
  * content_assets, environments, embed_widgets, analytics_events,
  * analytics_daily, api_keys
  *
- * Pricing: Free (5 garments) / Creator $49 (50) / Studio $149 (unlimited)
+ * Pricing: Free (5 garments) / Creator $49/mo (50) / Studio $149/mo (unlimited)
  */
 
 import { Hono } from 'hono';
@@ -24,6 +25,63 @@ interface Env {
   SVC_BRAIN: Fetcher;
   WORKER_VERSION: string;
   ECHO_API_KEY?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  ANALYTICS: AnalyticsEngineDataset;
+}
+
+// ═══ Stripe Helpers ═══
+const STRIPE_API = 'https://api.stripe.com/v1';
+
+const PLAN_PRICE_MAP: Record<string, { price_cents: number; name: string; max_products: number }> = {
+  creator: { price_cents: 4900, name: 'Echo Runway Creator', max_products: 50 },
+  studio: { price_cents: 14900, name: 'Echo Runway Studio', max_products: 999999 },
+};
+
+async function stripeRequest(env: Env, path: string, method: string, body?: URLSearchParams): Promise<any> {
+  const res = await fetch(`${STRIPE_API}${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: body?.toString(),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data as any)?.error?.message || `Stripe API error ${res.status}`);
+  return data;
+}
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts = sigHeader.split(',').reduce((acc: Record<string, string>, part) => {
+    const [k, v] = part.split('=');
+    if (k && v) acc[k.trim()] = v.trim();
+    return acc;
+  }, {});
+
+  const timestamp = parts['t'];
+  const v1Sig = parts['v1'];
+  if (!timestamp || !v1Sig) return false;
+
+  // Replay protection: reject signatures older than 5 minutes
+  const ts = parseInt(timestamp, 10);
+  if (isNaN(ts) || Math.abs(Date.now() / 1000 - ts) > 300) return false;
+
+  const signedPayload = `${timestamp}.${payload}`;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Constant-time comparison
+  if (expected.length !== v1Sig.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) {
+    mismatch |= expected.charCodeAt(i) ^ v1Sig.charCodeAt(i);
+  }
+  return mismatch === 0;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -35,8 +93,10 @@ app.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization', 'X-Echo-API-Key', 'X-Tenant-ID'],
 }));
 
-// Auth middleware for write operations
+// Auth middleware for write operations (exempts webhook paths)
 function requireAuth(c: any, next: any) {
+  const path = c.req.path;
+  if (path.startsWith('/webhooks/')) return next();
   const key = c.req.header('X-Echo-API-Key') || c.req.header('Authorization')?.replace('Bearer ', '');
   const tenantKey = c.req.header('X-Tenant-API-Key');
   if (key === c.env.ECHO_API_KEY || tenantKey) return next();
@@ -51,9 +111,9 @@ function getTenantId(c: any): string | null {
 // ═══ Root / Health ═══
 app.get('/', (c) => c.json({
   service: 'echo-runway',
-  version: c.env.WORKER_VERSION || '1.0.0',
+  version: c.env.WORKER_VERSION || '2.0.0',
   status: 'operational',
-  description: 'AI Fashion Content Platform — real-time 3D runway, AI content pipeline, analytics',
+  description: 'AI Fashion Content Platform — real-time 3D runway, AI content pipeline, analytics, Stripe payments',
   endpoints: {
     health: '/health',
     tenants: '/api/tenants',
@@ -66,6 +126,8 @@ app.get('/', (c) => c.json({
     shopify: '/api/shopify',
     ai: '/api/ai',
     media: '/api/media',
+    plans: '/plans',
+    stripe_webhook: '/webhooks/stripe',
   },
   pricing: { free: '5 garments', creator: '$49/mo - 50 garments', studio: '$149/mo - unlimited' },
 }));
@@ -76,9 +138,10 @@ app.get('/health', async (c) => {
     const r = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM tenants').first<{ cnt: number }>();
     return c.json({
       status: 'healthy',
-      version: c.env.WORKER_VERSION || '1.0.0',
+      version: c.env.WORKER_VERSION || '2.0.0',
       latency_ms: Date.now() - start,
       tenants: r?.cnt || 0,
+      stripe: !!c.env.STRIPE_SECRET_KEY,
       timestamp: new Date().toISOString(),
     });
   } catch (e: any) {
@@ -374,12 +437,18 @@ app.post('/api/products', async (c) => {
   const { tenant_id, name, slug, description, price, currency, category, sku, glb_url, thumbnail_url } = body;
   if (!tenant_id || !name) return c.json({ error: 'tenant_id and name required' }, 400);
 
-  // Check plan limits
-  const tenant = await c.env.DB.prepare('SELECT max_products FROM tenants WHERE id=?').bind(tenant_id).first<{ max_products: number }>();
+  // Check plan limits (downgrade expired subscriptions to free)
+  const tenant = await c.env.DB.prepare('SELECT plan, max_products, plan_expires_at FROM tenants WHERE id=?').bind(tenant_id).first<{ plan: string; max_products: number; plan_expires_at: string | null }>();
   if (!tenant) return c.json({ error: 'Tenant not found' }, 404);
+  let effectiveMax = tenant.max_products;
+  if (tenant.plan !== 'free' && tenant.plan_expires_at && new Date(tenant.plan_expires_at) < new Date()) {
+    // Subscription expired — enforce free limits
+    effectiveMax = 5;
+    await c.env.DB.prepare("UPDATE tenants SET plan='free', max_products=5, updated_at=datetime('now') WHERE id=?").bind(tenant_id).run();
+  }
   const productCount = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM products WHERE tenant_id=? AND status=?').bind(tenant_id, 'active').first<{ cnt: number }>();
-  if ((productCount?.cnt || 0) >= tenant.max_products) {
-    return c.json({ error: 'Product limit reached. Upgrade your plan.', current: productCount?.cnt, limit: tenant.max_products }, 403);
+  if ((productCount?.cnt || 0) >= effectiveMax) {
+    return c.json({ error: 'Product limit reached. Upgrade your plan.', current: productCount?.cnt, limit: effectiveMax, upgrade_url: '/plans/upgrade' }, 403);
   }
 
   const productSlug = slug || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '');
@@ -1000,6 +1069,195 @@ async function processContentJob(env: Env, jobId: number, tenantId: number, prod
     await env.DB.prepare("UPDATE content_jobs SET status='failed', error=? WHERE id=?").bind(e.message, jobId).run();
   }
 }
+
+// ═══ STRIPE WEBHOOK ═══
+app.post('/webhooks/stripe', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY || !c.env.STRIPE_WEBHOOK_SECRET) {
+    return c.json({ error: 'Stripe not configured' }, 503);
+  }
+
+  const rawBody = await c.req.text();
+  const sigHeader = c.req.header('Stripe-Signature') || '';
+  const valid = await verifyStripeSignature(rawBody, sigHeader, c.env.STRIPE_WEBHOOK_SECRET);
+  if (!valid) return c.json({ error: 'Invalid signature' }, 400);
+
+  const event = JSON.parse(rawBody);
+  const eventType = event.type as string;
+  const obj = event.data?.object;
+
+  try {
+    if (eventType === 'checkout.session.completed') {
+      const tenantId = obj.metadata?.tenant_id;
+      const plan = obj.metadata?.plan;
+      if (!tenantId || !plan) return c.json({ ok: true, skipped: 'missing metadata' });
+
+      const cfg = PLAN_PRICE_MAP[plan];
+      if (!cfg) return c.json({ ok: true, skipped: 'unknown plan' });
+
+      const customerId = obj.customer;
+      const subscriptionId = obj.subscription;
+      // Subscription renews monthly — set expiry 35 days out (buffer for Stripe retries)
+      const expiresAt = new Date(Date.now() + 35 * 86400000).toISOString();
+
+      await c.env.DB.prepare(
+        "UPDATE tenants SET plan=?, max_products=?, stripe_customer_id=?, stripe_subscription_id=?, plan_expires_at=?, updated_at=datetime('now') WHERE id=?"
+      ).bind(plan, cfg.max_products, customerId, subscriptionId, expiresAt, tenantId).run();
+
+      return c.json({ ok: true, action: 'plan_upgraded', tenant_id: tenantId, plan });
+    }
+
+    if (eventType === 'invoice.paid') {
+      // Recurring payment succeeded — extend subscription
+      const customerId = obj.customer;
+      if (!customerId) return c.json({ ok: true, skipped: 'no customer' });
+
+      const tenant = await c.env.DB.prepare('SELECT id FROM tenants WHERE stripe_customer_id=?').bind(customerId).first<{ id: number }>();
+      if (tenant) {
+        const expiresAt = new Date(Date.now() + 35 * 86400000).toISOString();
+        await c.env.DB.prepare("UPDATE tenants SET plan_expires_at=?, updated_at=datetime('now') WHERE id=?").bind(expiresAt, tenant.id).run();
+      }
+      return c.json({ ok: true, action: 'subscription_renewed' });
+    }
+
+    if (eventType === 'customer.subscription.deleted') {
+      // Subscription cancelled — downgrade to free
+      const customerId = obj.customer;
+      if (!customerId) return c.json({ ok: true, skipped: 'no customer' });
+
+      const tenant = await c.env.DB.prepare('SELECT id FROM tenants WHERE stripe_customer_id=?').bind(customerId).first<{ id: number }>();
+      if (tenant) {
+        await c.env.DB.prepare(
+          "UPDATE tenants SET plan='free', max_products=5, stripe_subscription_id=NULL, plan_expires_at=NULL, updated_at=datetime('now') WHERE id=?"
+        ).bind(tenant.id).run();
+      }
+      return c.json({ ok: true, action: 'subscription_cancelled' });
+    }
+
+    return c.json({ ok: true, event: eventType, handled: false });
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+// ═══ PLAN MANAGEMENT ═══
+app.get('/plans', async (c) => {
+  const tenantId = getTenantId(c);
+  if (!tenantId) return c.json({
+    ok: true,
+    plans: {
+      free: { price: 0, max_products: 5, features: ['5 garments', 'Basic AI content', 'Analytics'] },
+      creator: { price: 49, max_products: 50, features: ['50 garments', 'Full AI pipeline', 'Priority support', 'Shopify sync'] },
+      studio: { price: 149, max_products: 999999, features: ['Unlimited garments', 'Full AI pipeline', 'Priority support', 'Shopify sync', 'Custom environments', 'White-label embed'] },
+    },
+  });
+
+  const tenant = await c.env.DB.prepare('SELECT id, name, plan, max_products, stripe_customer_id, stripe_subscription_id, plan_expires_at FROM tenants WHERE id=? OR slug=?').bind(tenantId, tenantId).first<any>();
+  if (!tenant) return c.json({ error: 'Tenant not found' }, 404);
+
+  const productCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM products WHERE tenant_id=? AND status='active'").bind(tenant.id).first<{ cnt: number }>();
+
+  // Check for expired subscription
+  let currentPlan = tenant.plan;
+  if (currentPlan !== 'free' && tenant.plan_expires_at && new Date(tenant.plan_expires_at) < new Date()) {
+    currentPlan = 'free';
+  }
+
+  return c.json({
+    ok: true,
+    current: {
+      plan: currentPlan,
+      max_products: currentPlan === 'free' ? 5 : PLAN_PRICE_MAP[currentPlan]?.max_products || tenant.max_products,
+      used_products: productCount?.cnt || 0,
+      has_subscription: !!tenant.stripe_subscription_id,
+      expires_at: tenant.plan_expires_at,
+    },
+    plans: {
+      free: { price: 0, max_products: 5 },
+      creator: { price: 49, max_products: 50 },
+      studio: { price: 149, max_products: 999999 },
+    },
+  });
+});
+
+app.post('/plans/upgrade', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 503);
+
+  const body = await c.req.json<any>();
+  const { tenant_id, plan, success_url, cancel_url } = body;
+  if (!tenant_id || !plan) return c.json({ error: 'tenant_id and plan required' }, 400);
+
+  const cfg = PLAN_PRICE_MAP[plan];
+  if (!cfg) return c.json({ error: 'Invalid plan. Must be: creator or studio' }, 400);
+
+  const tenant = await c.env.DB.prepare('SELECT id, name, slug, contact_email, stripe_customer_id FROM tenants WHERE id=? OR slug=?').bind(tenant_id, tenant_id).first<any>();
+  if (!tenant) return c.json({ error: 'Tenant not found' }, 404);
+
+  try {
+    // Create or reuse Stripe customer
+    let customerId = tenant.stripe_customer_id;
+    if (!customerId) {
+      const params = new URLSearchParams();
+      params.set('name', tenant.name);
+      if (tenant.contact_email) params.set('email', tenant.contact_email);
+      params.set('metadata[tenant_id]', String(tenant.id));
+      params.set('metadata[slug]', tenant.slug);
+      const customer = await stripeRequest(c.env, '/customers', 'POST', params);
+      customerId = customer.id;
+      await c.env.DB.prepare("UPDATE tenants SET stripe_customer_id=?, updated_at=datetime('now') WHERE id=?").bind(customerId, tenant.id).run();
+    }
+
+    // Create a Stripe price on the fly (or use existing)
+    const priceParams = new URLSearchParams();
+    priceParams.set('unit_amount', String(cfg.price_cents));
+    priceParams.set('currency', 'usd');
+    priceParams.set('recurring[interval]', 'month');
+    priceParams.set('product_data[name]', cfg.name);
+    priceParams.set('product_data[metadata][plan]', plan);
+    const price = await stripeRequest(c.env, '/prices', 'POST', priceParams);
+
+    // Create Checkout Session
+    const sessionParams = new URLSearchParams();
+    sessionParams.set('customer', customerId);
+    sessionParams.set('mode', 'subscription');
+    sessionParams.set('line_items[0][price]', price.id);
+    sessionParams.set('line_items[0][quantity]', '1');
+    sessionParams.set('metadata[tenant_id]', String(tenant.id));
+    sessionParams.set('metadata[plan]', plan);
+    sessionParams.set('success_url', success_url || `https://echo-runway.bmcii1976.workers.dev/plans?tenant_id=${tenant.id}&upgraded=${plan}`);
+    sessionParams.set('cancel_url', cancel_url || `https://echo-runway.bmcii1976.workers.dev/plans?tenant_id=${tenant.id}&cancelled=true`);
+    const session = await stripeRequest(c.env, '/checkout/sessions', 'POST', sessionParams);
+
+    return c.json({ ok: true, checkout_url: session.url, session_id: session.id });
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+// ═══ ADMIN: Stripe Migration ═══
+app.post('/admin/migrate-stripe', async (c) => {
+  const key = c.req.header('X-Echo-API-Key');
+  if (key !== c.env.ECHO_API_KEY) return c.json({ error: 'Unauthorized' }, 401);
+
+  const migrations = [
+    "ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT",
+    "ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT",
+    "ALTER TABLE tenants ADD COLUMN plan_expires_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_tenants_stripe_customer ON tenants(stripe_customer_id)",
+  ];
+
+  const results: { sql: string; status: string }[] = [];
+  for (const sql of migrations) {
+    try {
+      await c.env.DB.prepare(sql).run();
+      results.push({ sql: sql.slice(0, 60), status: 'OK' });
+    } catch (e: any) {
+      // "duplicate column" is expected on re-run
+      results.push({ sql: sql.slice(0, 60), status: e.message.includes('duplicate') ? 'ALREADY_EXISTS' : `ERR: ${e.message}` });
+    }
+  }
+
+  return c.json({ ok: true, migrations: results });
+});
 
 // ═══ EXPORT ═══
 export default {
