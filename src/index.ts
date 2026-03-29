@@ -17,6 +17,8 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 
+const ALLOWED_ORIGINS = ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://profinishusa.com','https://bgat.echo-op.com'];
+
 interface Env {
   DB: D1Database;
   CACHE: KVNamespace;
@@ -88,7 +90,7 @@ const app = new Hono<{ Bindings: Env }>();
 
 // ═══ Middleware ═══
 app.use('*', cors({
-  origin: '*',
+  origin: (o) => ALLOWED_ORIGINS.includes(o) ? o : ALLOWED_ORIGINS[0],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Echo-API-Key', 'X-Tenant-ID'],
 }));
